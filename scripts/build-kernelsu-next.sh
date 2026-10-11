@@ -21,6 +21,8 @@
 #   CLANG_DIR=<内核目录>/../clang   含 bin/clang 的工具链目录
 #   OUT_DIR=<内核目录>/dist
 #   JOBS=10               make 并行度（默认 nproc --all）
+#   USE_CCACHE=0/1       是否用 ccache（默认 auto：PATH 里有 ccache 就用；设 0 关闭）
+#   CCACHE_DIR / CCACHE_MAXSIZE / CCACHE_SLOPPINESS   透传给 ccache 的环境变量
 #   KSU_VERSION_OVERRIDE  覆盖内核内嵌的 KSU 版本号（传给 Kbuild）
 #   SKIP_KSU_SYNC=1       不 clone/fetch KernelSU-Next
 #   LOG_TO_STDOUT=1       构建日志同时打印到标准输出（CI 用）
@@ -76,6 +78,7 @@ OUT_DIR=${OUT_DIR:-$KERNEL_DIR/dist}
 JOBS=${JOBS:-$(nproc --all 2>/dev/null || echo 4)}
 LOG=$OUT_DIR/build-$DEVICE-$TYPE.log
 BUILD_START=$(date '+%Y-%m-%d %H:%M:%S %z')
+BUILD_START_EPOCH=$(date +%s)
 
 mkdir -p "$OUT_DIR"
 
@@ -84,6 +87,26 @@ if [ ! -x "$CLANG_BIN" ]; then
   echo "错误: 找不到 clang: $CLANG_BIN" >&2
   echo "请设置 CLANG_DIR 指向含 bin/clang 的工具链目录（作者脚本约定为 <内核目录>/../clang）" >&2
   exit 3
+fi
+
+# ---- ccache（可选；默认 auto：PATH 里能找到 ccache 就用）----
+# 命中 ccache 时编出来的结果与不用 ccache 完全一致，只是省掉重复编译的时间。
+CC_ARG=clang
+CCACHE_USED=no
+if [ "${USE_CCACHE:-auto}" != "0" ]; then
+  if command -v ccache >/dev/null 2>&1; then
+    export CCACHE_DIR=${CCACHE_DIR:-$HOME/.ccache}
+    export CCACHE_MAXSIZE=${CCACHE_MAXSIZE:-2G}
+    # 编译器按内容校验：工具链换了（哪怕路径名字不变）不会误命中
+    export CCACHE_COMPILERCHECK=${CCACHE_COMPILERCHECK:-content}
+    # 内核源码里大量 __DATE__/__TIME__ 与文件时间宏；用 sloppiness 换命中率（文件内容仍参与哈希）
+    export CCACHE_SLOPPINESS=${CCACHE_SLOPPINESS:-time_macros,file_stat_matches,include_file_mtime,include_file_ctime}
+    CC_ARG="ccache clang"
+    CCACHE_USED=yes
+    echo ">> ccache: $(ccache --version | head -n1)  目录: $CCACHE_DIR  上限: $CCACHE_MAXSIZE"
+  else
+    echo ">> 未找到 ccache，按普通 clang 编译（装 ccache 或设 USE_CCACHE=0 可消除本提示）" >&2
+  fi
 fi
 
 # ---- KernelSU-Next 源码同步 ----
@@ -225,7 +248,7 @@ for _f in $KSU_PATCH_PATHS; do
   cp -p "$KERNEL_DIR/$_f" "$KSU_SNAP_DIR/$_f" 2>/dev/null || true
 done
 
-if ! run_logged make -j"$JOBS" O=out CC=clang ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- NM=llvm-nm OBJDUMP=llvm-objdump STRIP=llvm-strip; then
+if ! run_logged make -j"$JOBS" O=out CC="$CC_ARG" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- NM=llvm-nm OBJDUMP=llvm-objdump STRIP=llvm-strip; then
   echo "错误: 编译失败，日志尾部:" >&2; tail -n 60 "$LOG" >&2; exit 6
 fi
 
@@ -288,6 +311,8 @@ rm -rf tmp
 ZIP_SIZE=$(stat -c %s "$OUT_DIR/$ZIP_NAME")
 ZIP_MD5=$(md5sum "$OUT_DIR/$ZIP_NAME" | awk '{print $1}')
 ZIP_SHA256=$(sha256sum "$OUT_DIR/$ZIP_NAME" | awk '{print $1}')
+BUILD_END_STR=$(date '+%Y-%m-%d %H:%M:%S %z')
+BUILD_SECONDS=$(( $(date +%s) - BUILD_START_EPOCH ))
 
 # ---- 构建信息 ----
 INFO="$OUT_DIR/build-info-$DEVICE-$TYPE.txt"
@@ -328,7 +353,9 @@ PANEL_DTSI=$PANEL_DTSI
 BUILD_JOBS=$JOBS
 BUILD_HOST=$(uname -n)
 BUILD_TIME=$BUILD_START
-BUILD_END=$(date '+%Y-%m-%d %H:%M:%S %z')
+BUILD_END=$BUILD_END_STR
+BUILD_SECONDS=$BUILD_SECONDS
+BUILD_CCACHE=$CCACHE_USED
 IMAGE_RAW_SIZE=$IMAGE_RAW_SIZE
 ZIP_NAME=$ZIP_NAME
 ZIP_SIZE=$ZIP_SIZE
@@ -341,4 +368,8 @@ echo "   内核: $KERNEL_SHORT ($KERNEL_BRANCH)  变体: $TYPE"
 echo "   KernelSU-Next: $KSU_DESC -> KSU_VERSION=$KSU_VERSION"
 echo "   镜像内 KSU tag 核对: $IMAGE_KSU_TAG | 横幅: $IMAGE_KSU_BANNER"
 echo "   大小: $ZIP_SIZE  md5: $ZIP_MD5"
+echo "   耗时: ${BUILD_SECONDS}s  ccache: $CCACHE_USED"
 echo "   信息文件: $INFO"
+if [ "$CCACHE_USED" = "yes" ]; then
+  ccache -s 2>/dev/null | sed 's/^/   /' || true
+fi

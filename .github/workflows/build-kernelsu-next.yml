@@ -1,8 +1,10 @@
 name: Build kernel (KernelSU-Next)
 
 # 一键构建：Actions → Build kernel (KernelSU-Next) → Run workflow
-# 自动拉取 KernelSU-Next 指定引用（默认：legacy 分支上最新的 tag，即作者已发布的版本）→ 编译 AOSP / HyperOS 两个变体
-# → 合并成容器包 → 生成 Release 说明（含内核 commit、KernelSU-Next commit、版本号、管理器对应关系）→ 发布
+# 自动拉取 KernelSU-Next 指定引用（默认：legacy 分支上最新的 tag，即作者已发布的版本）
+# → 同一个 job 里先编 AOSP，再复用 out/ 编 HyperOS（第二个变体只重编面板 dtbo，几秒钟的事）
+# → ccache 缓存编译结果（第二次及以后运行可大幅缩短）→ 合并成容器包
+# → 生成 Release 说明（含内核 commit、KernelSU-Next commit、版本号、管理器对应关系）→ 发布
 
 on:
   workflow_dispatch:
@@ -174,14 +176,10 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   build:
-    name: 编译 ${{ matrix.variant }}
+    name: 编译 AOSP + HyperOS
     needs: meta
     runs-on: ubuntu-latest
     timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      matrix:
-        variant: [aosp, hyperos]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -195,7 +193,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             bc bison flex libssl-dev libelf-dev p7zip-full zip wget curl perl cpio rsync \
-            gcc-aarch64-linux-gnu binutils
+            ccache gcc-aarch64-linux-gnu binutils
       - name: 缓存 WeebX clang
         id: clang
         uses: actions/cache@v4
@@ -211,24 +209,46 @@ jobs:
           tar -xzf clang.tar.gz -C clang
           rm -f clang.tar.gz
           clang/bin/clang --version | head -n1
-      - name: 编译内核（接入 KernelSU-Next）
+      # 缓存按 run_id 建新条目、用 restore-keys 取最近一条：每轮都能把新编出来的目标文件存进去，
+      # 旧条目由 GitHub 按 LRU 自动淘汰（仓库缓存上限 10 GB）
+      - name: 缓存 ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-${{ env.CLANG_CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ env.CLANG_CACHE_KEY }}-
+      - name: 编译内核（AOSP → HyperOS，共用一个 out/）
         env:
           # 固定到 meta 解析出的 commit，保证两个变体用的是同一版 KernelSU-Next
           KSU_REF: ${{ needs.meta.outputs.ksu_commit }}
           LOG_TO_STDOUT: '1'
+          USE_CCACHE: '1'
         run: |
+          set -euo pipefail
           chmod +x kernel/scripts/build-kernelsu-next.sh
-          kernel/scripts/build-kernelsu-next.sh "${{ needs.meta.outputs.device }}" "${{ matrix.variant }}"
+          DEV="${{ needs.meta.outputs.device }}"
+          mkdir -p artifacts
+          # 先编 AOSP（全量），再编 HyperOS：复用同一个 out/，只重编面板 dtbo/dtb 相关目标
+          for variant in aosp hyperos; do
+            echo "::group::编译 $variant"
+            kernel/scripts/build-kernelsu-next.sh "$DEV" "$variant"
+            echo "::endgroup::"
+            cp -p kernel/dist/*.zip kernel/dist/build-info-*.txt kernel/dist/build-*.log artifacts/
+          done
+          ls -l artifacts
       - name: 上传构建产物
+        # 即使后面某个变体失败，也把已经编好的包传上去便于排查
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-${{ matrix.variant }}
-          if-no-files-found: error
+          name: kernel
+          if-no-files-found: warn
           retention-days: 14
           path: |
-            kernel/dist/*.zip
-            kernel/dist/build-info-*.txt
-            kernel/dist/build-*.log
+            artifacts/*.zip
+            artifacts/build-info-*.txt
+            artifacts/build-*.log
 
   release:
     name: 发布 Release
