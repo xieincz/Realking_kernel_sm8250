@@ -145,3 +145,14 @@ out/
 
 # KernelSU-Next source (fetched by scripts/setup-kernelsu-next.sh)
 /KernelSU-Next/
+
+# 构建产物目录（scripts/build-kernelsu-next.sh）
+/dist/
+
+# Python 缓存
+__pycache__/
+
+# GitHub Actions 工作流必须纳入版本控制（本仓库 .gitignore 里 .github 被忽略）
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml

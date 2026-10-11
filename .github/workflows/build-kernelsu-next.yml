@@ -1,0 +1,284 @@
+name: Build kernel (KernelSU-Next)
+
+# 一键构建：Actions → Build kernel (KernelSU-Next) → Run workflow
+# 自动拉取 KernelSU-Next 指定引用（默认：legacy 分支上最新的 tag，即作者已发布的版本）→ 编译 AOSP / HyperOS 两个变体
+# → 合并成容器包 → 生成 Release 说明（含内核 commit、KernelSU-Next commit、版本号、管理器对应关系）→ 发布
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: '目标设备（apollo 需自行确认 defconfig 里已有 KernelSU 配置）'
+        type: choice
+        options:
+          - alioth
+          - apollo
+        default: alioth
+      ksu_ref:
+        description: 'KernelSU-Next 引用。留空 = legacy 分支上最新的 tag（作者已发布版本，推荐）；填 legacy = 分支最新提交（可能尚未发布/测试）；也可填具体 tag 或 commit'
+        type: string
+        default: ''
+      publish_release:
+        description: '构建完成后发布到 Release'
+        type: boolean
+        default: true
+      release_tag:
+        description: 'Release tag（留空则自动生成 kernel-<设备>-KSUNext-<tag>-<版本号>-<日期>）'
+        type: string
+        default: ''
+  push:
+    tags:
+      - 'kernel-*'
+
+concurrency:
+  group: build-kernel-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CLANG_CACHE_KEY: WeebX-Clang-19.1.5
+  CLANG_URL: https://github.com/XSans0/WeebX-Clang/releases/download/WeebX-Clang-19.1.5-release/WeebX-Clang-19.1.5.tar.gz
+  KSU_REPO: https://github.com/KernelSU-Next/KernelSU-Next.git
+
+jobs:
+  meta:
+    name: 解析版本信息
+    runs-on: ubuntu-latest
+    outputs:
+      device: ${{ steps.info.outputs.device }}
+      kernel_commit: ${{ steps.info.outputs.kernel_commit }}
+      kernel_short: ${{ steps.info.outputs.kernel_short }}
+      kernel_subject: ${{ steps.info.outputs.kernel_subject }}
+      kernel_localversion: ${{ steps.info.outputs.kernel_localversion }}
+      ksu_ref: ${{ steps.info.outputs.ksu_ref }}
+      ksu_tag_exact: ${{ steps.info.outputs.ksu_tag_exact }}
+      ksu_since_tag: ${{ steps.info.outputs.ksu_since_tag }}
+      ksu_commit: ${{ steps.info.outputs.ksu_commit }}
+      ksu_short: ${{ steps.info.outputs.ksu_short }}
+      ksu_tag: ${{ steps.info.outputs.ksu_tag }}
+      ksu_describe: ${{ steps.info.outputs.ksu_describe }}
+      ksu_version: ${{ steps.info.outputs.ksu_version }}
+      ksu_count: ${{ steps.info.outputs.ksu_count }}
+      manager_tag: ${{ steps.info.outputs.manager_tag }}
+      manager_version: ${{ steps.info.outputs.manager_version }}
+      manager_apk: ${{ steps.info.outputs.manager_apk }}
+      manager_apk_spoofed: ${{ steps.info.outputs.manager_apk_spoofed }}
+      manager_min_kernel: ${{ steps.info.outputs.manager_min_kernel }}
+      date: ${{ steps.info.outputs.date }}
+      release_tag: ${{ steps.info.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 解析 KernelSU-Next / 管理器 / 内核版本
+        id: info
+        env:
+          KSU_REF_IN: ${{ inputs.ksu_ref }}
+          KSU_BRANCH: legacy
+          DEVICE: ${{ inputs.device || 'alioth' }}
+          RELEASE_TAG_IN: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          out() { printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"; }
+          KSU_REF_IN="${KSU_REF_IN:-}"
+          KSU_BRANCH="${KSU_BRANCH:-legacy}"
+          DEVICE="${DEVICE:-alioth}"
+
+          # ---- KernelSU-Next：解析引用并算出内核会内嵌的版本号 ----
+          git clone --filter=blob:none --no-checkout "$KSU_REPO" /tmp/ksu
+          cd /tmp/ksu
+          if [ -z "$KSU_REF_IN" ]; then
+            # 留空：取该分支上最新的 tag（作者已发布/测试过的版本），而不是分支最新提交
+            REF=$(git describe --tags --abbrev=0 "origin/${KSU_BRANCH}^{commit}")
+            KSU_REF_USED="$REF"
+            RESOLVE_NOTE="留空 → 自动取 ${KSU_BRANCH} 分支上最新的 tag"
+          elif git rev-parse --verify --quiet "origin/${KSU_REF_IN}^{commit}" >/dev/null 2>&1; then
+            REF="origin/${KSU_REF_IN}"
+            KSU_REF_USED="$KSU_REF_IN"
+            RESOLVE_NOTE="分支 ${KSU_REF_IN} 的最新提交（可能尚未打 tag）"
+          elif git rev-parse --verify --quiet "${KSU_REF_IN}^{commit}" >/dev/null 2>&1; then
+            REF="${KSU_REF_IN}"
+            KSU_REF_USED="$KSU_REF_IN"
+            RESOLVE_NOTE="显式指定的 tag / commit"
+          else
+            echo "错误: 在 KernelSU-Next 里找不到引用 '${KSU_REF_IN}'" >&2
+            exit 1
+          fi
+          KSU_COMMIT=$(git rev-parse "${REF}^{commit}")
+          KSU_SHORT=$(git rev-parse --short=8 "${REF}^{commit}")
+          KSU_COUNT=$(git rev-list --count "${REF}^{commit}")
+          KSU_TAG=$(git describe --tags --abbrev=0 "${REF}^{commit}")
+          KSU_DESC=$(git describe --tags "${REF}^{commit}")
+          KSU_TAG_SHA=$(git rev-parse "${KSU_TAG}^{commit}")
+          if [ "$KSU_TAG_SHA" = "$KSU_COMMIT" ]; then KSU_TAG_EXACT=yes; else KSU_TAG_EXACT=no; fi
+          KSU_SINCE_TAG=$(git rev-list --count "${KSU_TAG}..${REF}^{commit}")
+          # 与 KernelSU-Next/kernel/Kbuild 完全相同的公式
+          KSU_VERSION=$((30000 + KSU_COUNT + 289))
+
+          # ---- 最新管理器（release）与它要求的最低内核版本 ----
+          MANAGER_JSON=$(curl -fsSL -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/KernelSU-Next/KernelSU-Next/releases/latest")
+          MANAGER_TAG=$(printf '%s' "$MANAGER_JSON" | jq -r '.tag_name')
+          MANAGER_APK=$(printf '%s' "$MANAGER_JSON" | jq -r '[.assets[].name | select(endswith("-release.apk")) | select(contains("spoofed") | not)] | first // ""')
+          MANAGER_APK_SPOOFED=$(printf '%s' "$MANAGER_JSON" | jq -r '[.assets[].name | select(endswith("-release.apk")) | select(contains("spoofed"))] | first // ""')
+          MANAGER_VERSION=$(printf '%s' "$MANAGER_APK" | grep -oE '_[0-9]+-release\.apk$' | tr -dc '0-9' || true)
+          MANAGER_MIN=$(git show "${MANAGER_TAG}:manager/app/src/main/java/com/rifsxd/ksunext/Natives.kt" 2>/dev/null \
+            | grep -oE 'MINIMAL_SUPPORTED_KERNEL = [0-9]+' | grep -oE '[0-9]+' || true)
+          if [ -z "$MANAGER_MIN" ]; then MANAGER_MIN=33188; fi
+
+          # ---- 内核信息 ----
+          cd "$GITHUB_WORKSPACE"
+          KERNEL_COMMIT=$(git rev-parse HEAD)
+          KERNEL_SHORT=$(git rev-parse --short=12 HEAD)
+          KERNEL_SUBJECT=$(git show -s --format=%s HEAD)
+          LOCALVERSION=$(sed -n 's/^CONFIG_LOCALVERSION="\(.*\)"$/\1/p' "arch/arm64/configs/${DEVICE}_defconfig" | head -n1)
+          LOCALVERSION_SLUG=$(printf '%s' "$LOCALVERSION" | sed -e 's|~RealKing//||' -e 's|[^A-Za-z0-9._-]|-|g')
+          DATE=$(date -u +%Y%m%d)
+          RELEASE_TAG="${RELEASE_TAG_IN:-}"
+          if [ -z "$RELEASE_TAG" ]; then
+            RELEASE_TAG="kernel-${DEVICE}-KSUNext-${KSU_TAG}-${KSU_VERSION}-${DATE}"
+          fi
+
+          out device "$DEVICE"
+          out kernel_commit "$KERNEL_COMMIT"
+          out kernel_short "$KERNEL_SHORT"
+          out kernel_subject "$KERNEL_SUBJECT"
+          out kernel_localversion "$LOCALVERSION_SLUG"
+          out ksu_ref "$KSU_REF_USED"
+          out ksu_tag_exact "$KSU_TAG_EXACT"
+          out ksu_since_tag "$KSU_SINCE_TAG"
+          out ksu_commit "$KSU_COMMIT"
+          out ksu_short "$KSU_SHORT"
+          out ksu_tag "$KSU_TAG"
+          out ksu_describe "$KSU_DESC"
+          out ksu_version "$KSU_VERSION"
+          out ksu_count "$KSU_COUNT"
+          out manager_tag "$MANAGER_TAG"
+          out manager_version "$MANAGER_VERSION"
+          out manager_apk "$MANAGER_APK"
+          out manager_apk_spoofed "$MANAGER_APK_SPOOFED"
+          out manager_min_kernel "$MANAGER_MIN"
+          out date "$DATE"
+          out release_tag "$RELEASE_TAG"
+
+          {
+            echo "### 版本信息"
+            echo "- 内核提交：\`${KERNEL_SHORT}\` ${KERNEL_SUBJECT}"
+            echo "- KernelSU-Next 引用：${RESOLVE_NOTE} → \`${KSU_REF_USED}\`"
+            echo "- KernelSU-Next：\`${KSU_DESC}\`（commit \`${KSU_SHORT}\`；正好是 tag：${KSU_TAG_EXACT}，落后 tag ${KSU_SINCE_TAG} 个提交）"
+            echo "- KSU 版本号：**${KSU_VERSION}**"
+            echo "- 管理器：\`${MANAGER_TAG}\` / \`${MANAGER_APK}\`（最低内核版本 ${MANAGER_MIN}）"
+            echo "- Release tag：\`${RELEASE_TAG}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: 编译 ${{ matrix.variant }}
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [aosp, hyperos]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: kernel
+      - name: 释放磁盘空间
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost || true
+          df -h /
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev p7zip-full zip wget curl perl cpio rsync \
+            gcc-aarch64-linux-gnu binutils
+      - name: 缓存 WeebX clang
+        id: clang
+        uses: actions/cache@v4
+        with:
+          path: clang
+          key: ${{ env.CLANG_CACHE_KEY }}-${{ runner.os }}
+      - name: 下载 WeebX clang（缓存未命中时）
+        if: steps.clang.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 5 -o clang.tar.gz "$CLANG_URL"
+          mkdir -p clang
+          tar -xzf clang.tar.gz -C clang
+          rm -f clang.tar.gz
+          clang/bin/clang --version | head -n1
+      - name: 编译内核（接入 KernelSU-Next）
+        env:
+          # 固定到 meta 解析出的 commit，保证两个变体用的是同一版 KernelSU-Next
+          KSU_REF: ${{ needs.meta.outputs.ksu_commit }}
+          LOG_TO_STDOUT: '1'
+        run: |
+          chmod +x kernel/scripts/build-kernelsu-next.sh
+          kernel/scripts/build-kernelsu-next.sh "${{ needs.meta.outputs.device }}" "${{ matrix.variant }}"
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ matrix.variant }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            kernel/dist/*.zip
+            kernel/dist/build-info-*.txt
+            kernel/dist/build-*.log
+
+  release:
+    name: 发布 Release
+    needs: [meta, build]
+    if: ${{ github.event_name == 'push' || inputs.publish_release }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: kernel
+      - name: 安装依赖
+        run: sudo apt-get update && sudo apt-get install -y p7zip-full
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: 合并成容器包
+        id: pack
+        run: |
+          set -euo pipefail
+          cd artifacts
+          CONTAINER="RealKing-${{ needs.meta.outputs.device }}-${{ needs.meta.outputs.kernel_localversion }}-Container-KSUNext-${{ needs.meta.outputs.ksu_tag }}-${{ needs.meta.outputs.ksu_version }}-${{ needs.meta.outputs.date }}.zip"
+          7z a -mx9 "$CONTAINER" ./*.zip > /dev/null
+          7z l "$CONTAINER"
+          echo "container=$CONTAINER" >> "$GITHUB_OUTPUT"
+      - name: 生成 Release 说明与 build-info.json
+        run: |
+          python3 kernel/scripts/gen-release-notes.py \
+            --artifacts artifacts \
+            --container "${{ steps.pack.outputs.container }}" \
+            --manager-tag "${{ needs.meta.outputs.manager_tag }}" \
+            --manager-version "${{ needs.meta.outputs.manager_version }}" \
+            --manager-apk "${{ needs.meta.outputs.manager_apk }}" \
+            --manager-apk-spoofed "${{ needs.meta.outputs.manager_apk_spoofed }}" \
+            --manager-min-kernel "${{ needs.meta.outputs.manager_min_kernel }}" \
+            --repo-url "${{ github.server_url }}/${{ github.repository }}" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "::group::Release 说明预览"
+          cat artifacts/release-notes.md
+          echo "::endgroup::"
+      - name: 发布到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ needs.meta.outputs.release_tag }}
+          name: RealKing ${{ needs.meta.outputs.device }} · KernelSU-Next ${{ needs.meta.outputs.ksu_tag }} (${{ needs.meta.outputs.ksu_version }})
+          body_path: artifacts/release-notes.md
+          files: |
+            artifacts/*.zip
+            artifacts/build-info.json
+          fail_on_unmatched_files: true
+          make_latest: true
+          draft: false
