@@ -142,3 +142,6 @@ kernel/configs/android-*.cfg
 out/
 *.zip
 *.log
+
+# KernelSU-Next source (fetched by scripts/setup-kernelsu-next.sh)
+/KernelSU-Next/
